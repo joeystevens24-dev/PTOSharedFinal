@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PTO & Time‑Off Tracker — Shared</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-50">
+  <div class="max-w-7xl mx-auto p-3 text-xs text-slate-600">
+    <span id="sync-indicator">Loading…</span>
+  </div>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useMemo, useState, useEffect, useRef } = React;
+
+    // ===== Shared settings =====
+    const ORG_ID = "fishers-it"; // change if you want multiple orgs in one backend
+    const API_URL = `/api/state?org=${encodeURIComponent(ORG_ID)}`;
+    const LS_KEY = `pto-tracker-v1-${ORG_ID}`;
+
+    // Debounce helper
+    function debounce(fn, ms) {
+      let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+    }
+
+    // UI helpers
+    const pad = (n) => n.toString().padStart(2, "0");
+    const toISODate = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    const dayFromISO = (iso) => parseInt(iso.slice(8,10), 10);
+
+    function rangeDaysInclusive(startISO, endISO) {
+      const out = []; const s = new Date(startISO + "T00:00:00"); const e = new Date(endISO + "T00:00:00");
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) out.push(toISODate(d));
+      return out;
+    }
+    function monthMatrix(year, monthIndex) {
+      const first = new Date(year, monthIndex, 1);
+      const startDow = first.getDay();
+      const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+      const weeks = []; let week = new Array(7).fill(null); let day = 1;
+      for (let i = 0; i < startDow; i++) week[i] = null;
+      for (let i = startDow; i < 7; i++) week[i] = toISODate(new Date(year, monthIndex, day++));
+      weeks.push(week);
+      while (day <= daysInMonth) {
+        week = new Array(7).fill(null);
+        for (let i = 0; i < 7 && day <= daysInMonth; i++) week[i] = toISODate(new Date(year, monthIndex, day++));
+        weeks.push(week);
+      }
+      return weeks;
+    }
+
+    // Default org data
+    const DEFAULT_ORG = {
+      markets: {
+        Boise: { threshold: 2, teammates: ["Daniel Jackson","Roberto Espinoza","McKenna Peterson","Sarah Hart","Chirag Patel"] },
+        "Twin Falls": { threshold: 1, teammates: [] },
+        "Idaho Falls": { threshold: 1, teammates: ["Jim Grimm"] },
+        Spokane: { threshold: 1, teammates: ["Joseph Campton","Steve Lauzon"] },
+        "Salt Lake City": { threshold: 1, teammates: ["Travis Moore"] },
+        Missoula: { threshold: 2, teammates: ["Maya Johnson","Jacob Collins","Mike Hoffer"] },
+      },
+    };
+
+    // ---- Remote load/save (shared) with offline fallback ----
+    async function fetchRemoteState() {
+      try {
+        const res = await fetch(API_URL, { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          return data && typeof data === "object" ? data : null;
+        }
+      } catch { /* ignore */ }
+      return null;
+    }
+    async function saveRemoteState(state) {
+      try {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state),
+        });
+        return res.ok;
+      } catch { return false; }
+    }
+
+    const saveRemoteDebounced = debounce(saveRemoteState, 600);
+
+    function Card({ title, children }) {
+      return (<div className="bg-white rounded-2xl shadow p-4">{title && <h2 className="text-lg font-semibold mb-3">{title}</h2>}{children}</div>);
+    }
+    function Select({ label, value, onChange, options }) {
+      return (<label className="block text-sm"><span className="text-slate-600">{label}</span>
+        <select className="mt-1 w-full rounded-xl border border-slate-200 bg-white p-2" value={value} onChange={(e) => onChange(e.target.value)}>
+          {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select></label>);
+    }
+    function MonthPicker({ year, month, onChange }) {
+      const months = Array.from({length:12},(_,i)=>({label:new Date(2000,i,1).toLocaleString(undefined,{month:"short"}),value:i}));
+      return (<div className="flex items-center gap-2">
+        <button className="px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" onClick={()=>{const m=month-1;const y=m<0?year-1:year;onChange(y,(m+12)%12);}} aria-label="Previous month">◀</button>
+        <select className="rounded-xl border border-slate-200 bg-white p-2" value={month} onChange={(e)=>onChange(year,parseInt(e.target.value))}>
+          {months.map(m=> <option key={m.value} value={m.value}>{m.label}</option>)}
+        </select>
+        <input className="w-24 rounded-xl border border-slate-200 bg-white p-2" type="number" value={year} onChange={(e)=>onChange(parseInt(e.target.value||"0"),month)} />
+        <button className="px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" onClick={()=>{const m=month+1;const y=m>11?year+1:year;onChange(y,m%12);}} aria-label="Next month">▶</button>
+      </div>);
+    }
+
+    function AddPTOForm({ markets, types, onAdd }) {
+      const [market, setMarket] = useState(Object.keys(markets)[0] || "");
+      const [name, setName] = useState("");
+      const [type, setType] = useState(types[0]);
+      const [start, setStart] = useState(toISODate(new Date()));
+      const [end, setEnd] = useState(toISODate(new Date()));
+      const [notes, setNotes] = useState("");
+      const teammates = markets[market]?.teammates || [];
+
+      useEffect(()=>{ if (teammates.length && !teammates.includes(name)) setName(teammates[0]); }, [market]);
+
+      function submit(e){ e.preventDefault(); if(!market||!name||!start||!end) return;
+        const s=new Date(start), en=new Date(end); if(en<s) return alert("End date cannot be before start date.");
+        const entry={ id:(crypto?.randomUUID?.()||String(Date.now()+Math.random())), market, name, type, start, end, notes };
+        onAdd(entry); setNotes("");
+      }
+
+      return (<form onSubmit={submit} className="space-y-3">
+        <Select label="Market" value={market} onChange={setMarket} options={Object.keys(markets)} />
+        <label className="block text-sm"><span className="text-slate-600">Teammate</span>
+          <select className="mt-1 w-full rounded-xl border border-slate-200 bg-white p-2" value={name} onChange={(e)=>setName(e.target.value)}>
+            {teammates.length===0 && <option value="">— Add teammates in Organization —</option>}
+            {teammates.map(t=> <option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
+        <Select label="Type" value={type} onChange={setType} options={types} />
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block text-sm"><span className="text-slate-600">Start</span>
+            <input className="mt-1 w-full rounded-xl border border-slate-200 bg-white p-2" type="date" value={start} onChange={(e)=>setStart(e.target.value)} /></label>
+          <label className="block text-sm"><span className="text-slate-600">End</span>
+            <input className="mt-1 w-full rounded-xl border border-slate-200 bg-white p-2" type="date" value={end} onChange={(e)=>setEnd(e.target.value)} /></label>
+        </div>
+        <label className="block text-sm"><span className="text-slate-600">Notes</span>
+          <input className="mt-1 w-full rounded-xl border border-slate-200 bg-white p-2" type="text" placeholder="Optional" value={notes} onChange={(e)=>setNotes(e.target.value)} /></label>
+        <button type="submit" className="w-full px-3 py-2 rounded-xl shadow bg-slate-900 text-white hover:opacity-90">Add</button>
+      </form>);
+    }
+
+    function CalendarGrid({ monthLabel, weeks, markets, filters, countsByDayMarket }) {
+      const marketKeys = Object.keys(markets);
+      function dayRisk(dateISO, market) {
+        const rule = markets[market]?.threshold ?? 1;
+        const dayInfo = countsByDayMarket[dateISO]?.[market];
+        const count = dayInfo?.count || 0;
+        return { count, isRed: count >= rule, names: dayInfo?.names || [] };
+      }
+      return (<Card title={`Calendar — ${monthLabel}`}>
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate" style={{borderSpacing:8}}>
+            <thead><tr>{"SMTWTFS".split("").map(c=> <th key={c} className="text-left text-slate-500 font-medium">{c}</th>)}</tr></thead>
+            <tbody>
+              {weeks.map((week, wi)=> <tr key={wi}>
+                {week.map((dateISO, di)=> <td key={di} className="align-top w-[14%]">
+                  {dateISO ? <div className="bg-slate-100 rounded-xl p-2 h-full">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-semibold text-slate-600">{dayFromISO(dateISO)}</span>
+                    </div>
+                    <div className="space-y-1">
+                      {marketKeys.filter(m=>filters.market==="All"||m===filters.market).map(m=>{
+                        const {count,isRed,names}=dayRisk(dateISO,m);
+                        if(count===0) return <div key={m} className="text-[11px] text-slate-400">{m}: —</div>;
+                        return (<div key={m} className={`text-[11px] px-2 py-1 rounded-lg ${isRed ? "bg-red-200" : "bg-white"}`}>
+                          <div className="flex items-center justify-between"><span className="font-medium">{m}</span><span className="tabular-nums">{count} out</span></div>
+                          <div className="text-slate-600 truncate" title={names.join(", ")}>{names.join(", ")}</div>
+                        </div>);
+                      })}
+                    </div>
+                  </div> : <div className="h-20" />}
+                </td>)}
+              </tr>)}
+            </tbody>
+          </table>
+        </div>
+      </Card>);
+    }
+
+    function MonthList({ pto, year, month, filters }) {
+      const startISO = toISODate(new Date(year, month, 1));
+      const endISO = toISODate(new Date(year, month+1, 0));
+      const list = pto.filter(e => !(e.end < startISO || e.start > endISO))
+        .filter(e => filters.market==="All" ? true : e.market===filters.market)
+        .filter(e => filters.type==="All" ? true : e.type===filters.type)
+        .sort((a,b)=> a.start.localeCompare(b.start));
+      return (<div className="space-y-2">
+        {list.length===0 && <div className="text-sm text-slate-500">No entries for this month.</div>}
+        {list.map(e=> <div key={e.id} className="flex items-start justify-between bg-slate-50 rounded-xl p-3">
+          <div>
+            <div className="text-sm font-medium">{e.name} — <span className="text-slate-500">{e.market}</span></div>
+            <div className="text-xs text-slate-600">{e.type} • {e.start} → {e.end}</div>
+            {e.notes && <div className="text-xs text-slate-500 mt-1">{e.notes}</div>}
+          </div>
+          <DeleteButton id={e.id} />
+        </div>)}
+      </div>);
+    }
+
+    function DeleteButton({ id }){
+      const [hover,setHover]=useState(false);
+      function remove(){ if(!confirm("Delete this PTO entry?")) return; window.dispatchEvent(new CustomEvent("delete-pto",{detail:{id}})); }
+      return (<button onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)} onClick={remove} className="text-xs px-2 py-1 rounded-lg bg-white border border-slate-200 hover:bg-red-50">{hover?"Delete":"Remove"}</button>);
+    }
+
+    function OrgEditor({ state, setState }){
+      const [marketName,setMarketName]=useState(""); const [threshold,setThreshold]=useState(1);
+      const markets=state.org.markets;
+      function addMarket(e){ e.preventDefault(); const name=marketName.trim(); if(!name) return; if(markets[name]) return alert("Market already exists.");
+        setState(s=>({...s, org:{ markets:{...s.org.markets, [name]:{threshold:Number(threshold)||1, teammates:[]} } }})); setMarketName(""); setThreshold(1);
+      }
+      function addTeammate(m,person){ const p=person.trim(); if(!p) return;
+        setState(s=>({...s, org:{ markets:{...s.org.markets, [m]:{...s.org.markets[m], teammates:[...s.org.markets[m].teammates, p]} } }}));
+      }
+      function removeTeammate(m,idx){ setState(s=>{ const copy=[...s.org.markets[m].teammates]; copy.splice(idx,1);
+        return {...s, org:{ markets:{...s.org.markets, [m]:{...s.org.markets[m], teammates:copy} }}};
+      });}
+      return (<div className="space-y-4">
+        <div className="bg-slate-50 rounded-xl p-3">
+          <div className="font-medium mb-2">Add Market</div>
+          <form onSubmit={addMarket} className="grid grid-cols-3 gap-2">
+            <input className="col-span-2 rounded-xl border border-slate-200 bg-white p-2" placeholder="Market name" value={marketName} onChange={(e)=>setMarketName(e.target.value)} />
+            <input className="rounded-xl border border-slate-200 bg-white p-2" type="number" min={1} value={threshold} onChange={(e)=>setThreshold(e.target.value)} title="Threshold (people out to turn red)" />
+            <button className="col-span-3 px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" type="submit">Add</button>
+          </form>
+        </div>
+        {Object.entries(markets).map(([m,cfg])=> <div key={m} className="bg-slate-50 rounded-xl p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div><div className="font-medium">{m}</div><div className="text-xs text-slate-600">Red at ≥ {cfg.threshold} out</div></div>
+            <label className="text-xs">Threshold
+              <input className="ml-2 w-16 rounded-lg border border-slate-200 bg-white p-1" type="number" min={1} value={cfg.threshold}
+                onChange={(e)=>setState(s=>({...s, org:{ markets:{...s.org.markets, [m]:{...s.org.markets[m], threshold:Number(e.target.value)||1 } } }}))} />
+            </label>
+          </div>
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">Teammates</div>
+            <div className="flex flex-wrap gap-2">
+              {cfg.teammates.map((t,i)=> <span key={t+i} className="text-xs bg-white border border-slate-200 rounded-lg px-2 py-1 flex items-center gap-2">{t}
+                <button className="text-slate-400 hover:text-red-500" onClick={()=>removeTeammate(m,i)} title="Remove">✕</button></span>)}
+            </div>
+            <AddPerson inline onAdd={(name)=>addTeammate(m,name)} />
+          </div>
+        </div>)}
+      </div>);
+    }
+
+    function AddPerson({ inline=false, onAdd }){
+      const [val,setVal]=useState("");
+      function submit(e){ e.preventDefault(); if(!val.trim()) return; onAdd(val); setVal(""); }
+      return (<form onSubmit={submit} className={inline?"flex items-center gap-2":"space-y-2"}>
+        <input className="rounded-xl border border-slate-200 bg-white p-2" placeholder="Add teammate" value={val} onChange={(e)=>setVal(e.target.value)} />
+        <button className="px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" type="submit">Add</button>
+      </form>);
+    }
+
+    function App(){
+      const [state,setState]=useState({ org: DEFAULT_ORG, pto: [] });
+      const [loading,setLoading]=useState(true);
+      const [online,setOnline]=useState(false);
+      const today=new Date();
+      const [year,setYear]=useState(today.getFullYear());
+      const [month,setMonth]=useState(today.getMonth());
+      const [filters,setFilters]=useState({market:"All", type:"All"});
+
+      const syncEl = document.getElementById("sync-indicator");
+
+      // initial load: try remote, else local, else default
+      useEffect(()=>{
+        (async ()=>{
+          const remote = await fetchRemoteState();
+          if(remote){ setState(remote); setOnline(true); localStorage.setItem(LS_KEY, JSON.stringify(remote)); }
+          else{
+            const local = localStorage.getItem(LS_KEY);
+            if(local){ setState(JSON.parse(local)); }
+            else { setState({ org: DEFAULT_ORG, pto: [] }); }
+          }
+          setLoading(false);
+        })();
+      },[]);
+
+      // persist: local always; remote debounced when online or becomes online
+      useEffect(()=>{
+        if(loading) return;
+        localStorage.setItem(LS_KEY, JSON.stringify(state));
+        saveRemoteDebounced(state).then(ok=>{
+          if(ok){ setOnline(true); if(syncEl) syncEl.textContent = "Synced ✓"; }
+          else { setOnline(false); if(syncEl) syncEl.textContent = "Offline (changes saved locally)."; }
+        });
+      },[state]);
+
+      useEffect(()=>{ if(syncEl) syncEl.textContent = loading ? "Loading…" : (online ? "Synced ✓" : "Offline"); },[loading,online]);
+
+      useEffect(()=>{
+        function onDel(e){ const id=e.detail.id; setState(s=>({...s, pto: s.pto.filter(x=>x.id!==id)})); }
+        window.addEventListener("delete-pto", onDel);
+        return ()=>window.removeEventListener("delete-pto", onDel);
+      },[]);
+
+      const markets = Object.keys(state.org.markets);
+      const types = ["PTO","Sick","Holiday","Training","Other"];
+      const calendar = useMemo(()=>monthMatrix(year,month),[year,month]);
+      const countsByDayMarket = useMemo(()=>{
+        const map={};
+        state.pto.forEach(e=>{
+          rangeDaysInclusive(e.start,e.end).forEach(d=>{
+            map[d] ||= {}; map[d][e.market] ||= {count:0, names:[]};
+            map[d][e.market].count += 1;
+            if(!map[d][e.market].names.includes(e.name)) map[d][e.market].names.push(e.name);
+          });
+        });
+        return map;
+      },[state.pto]);
+
+      const monthLabel = new Date(year,month,1).toLocaleString(undefined,{month:"long",year:"numeric"});
+
+      if(loading){ return <div className="max-w-7xl mx-auto p-4 text-slate-600">Loading…</div>; }
+
+      return (<div className="min-h-screen bg-slate-50 text-slate-800 p-4">
+        <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-4 gap-4">
+          <header className="lg:col-span-4 flex items-center justify-between">
+            <h1 className="text-2xl md:text-3xl font-bold">PTO & Time‑Off Tracker</h1>
+            <div className="flex items-center gap-2">
+              <MonthPicker year={year} month={month} onChange={(y,m)=>{setYear(y);setMonth(m);}} />
+              <button className="px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" onClick={()=>{const t=new Date(); setYear(t.getFullYear()); setMonth(t.getMonth());}}>Today</button>
+            </div>
+          </header>
+
+          <aside className="lg:col-span-1 space-y-4">
+            <Card title="Add Time Off">
+              <AddPTOForm markets={state.org.markets} types={types} onAdd={(entry)=>setState(s=>({...s, pto:[...s.pto, entry]}))} />
+            </Card>
+            <Card title="Filters">
+              <div className="space-y-3">
+                <Select label="Market" value={filters.market} onChange={(v)=>setFilters(f=>({...f, market:v}))} options={["All", ...markets]} />
+                <Select label="Type" value={filters.type} onChange={(v)=>setFilters(f=>({...f, type:v}))} options={["All", ...types]} />
+                <button className="w-full mt-1 px-3 py-2 rounded-xl shadow bg-white hover:bg-slate-100" onClick={()=>setFilters({market:"All", type:"All"})}>Clear Filters</button>
+              </div>
+            </Card>
+            <Card title="Organization">
+              <OrgEditor state={state} setState={setState} />
+            </Card>
+          </aside>
+
+          <main className="lg:col-span-3">
+            <CalendarGrid monthLabel={monthLabel} weeks={calendar} markets={state.org.markets} filters={filters} countsByDayMarket={countsByDayMarket} />
+            <Card title="All PTO in Month">
+              <MonthList pto={state.pto} year={year} month={month} filters={filters} />
+            </Card>
+          </main>
+        </div>
+        <footer className="max-w-7xl mx-auto mt-6 text-sm text-slate-500">Shared via serverless backend. If offline, changes save locally and sync when online.</footer>
+      </div>);
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
